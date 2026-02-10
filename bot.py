@@ -72,4 +72,4 @@ async def main():
 
         for i, yt_link in enumerate(links):
             row_num = i + 2
-            timestamp = datetime.now().strftime("%H:%M:%S
+            timestamp = datetime.now().strftime("%H:%M:%S)
