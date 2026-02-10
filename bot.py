@@ -10,28 +10,28 @@ from google.oauth2.credentials import Credentials
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
-# These will be pulled from your GitHub Secrets
 FIXED_PASSWORD = os.getenv("FIXED_PASSWORD", "APNK@2901")
 SHEET_NAME = os.getenv("SHEET_NAME", "YoutubeBotLinks")
 
-# --- GOOGLE SHEETS SETUP ---
 def setup_sheets(name):
-    # Retrieve the token JSON string from GitHub Secrets
     token_json = os.getenv("GOOGLE_TOKEN")
     if not token_json:
-        raise ValueError("GOOGLE_TOKEN secret is missing in GitHub!")
+        raise ValueError("GOOGLE_TOKEN secret is missing!")
     
     token_data = json.loads(token_json)
-    
-    # Reconstruct credentials from your Colab output
     creds = Credentials.from_authorized_user_info(token_data)
-    
-    # Authorize and open the sheet
     gc = gspread.authorize(creds)
-    sh = gc.open(name)
-    return sh.get_worksheet(0)
+    
+    try:
+        sh = gc.open(name)
+        return sh.get_worksheet(0)
+    except Exception as e:
+        print(f"❌ Error: Could not find sheet '{name}'. Check your Secrets.")
+        # List sheets to help debug
+        available = [s.title for s in gc.openall()]
+        print(f"Available sheets: {available}")
+        raise e
 
-# --- GUERRILLA MAIL HELPERS ---
 def get_guerrilla_mail():
     try:
         res = requests.get("https://www.guerrillamail.com/ajax.php?f=get_email_address").json()
@@ -58,18 +58,69 @@ async def human_type(element, text):
 
 async def main():
     ws = setup_sheets(SHEET_NAME)
-    # Get all links from Column 1
-    links = ws.col_values(1)[1:] 
-    print(f"✅ Loaded {len(links)} links. Starting automation...")
+    links = ws.col_values(1)[1:]
+    print(f"✅ Loaded {len(links)} links. Starting...")
 
     async with async_playwright() as p:
-        # Headless MUST be True for GitHub Actions
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
 
         for i, yt_link in enumerate(links):
             row_num = i + 2
-            timestamp = datetime.now().strftime("%H:%M:%S)
+            timestamp = datetime.now().strftime("%H:%M:%S") # FIXED TYPO HERE
+            email, sid = get_guerrilla_mail()
+
+            try:
+                print(f"[{i+1}] Target: {yt_link} | Email: {email}")
+                await page.goto("https://youdiepie.com/password/reset", timeout=60000)
+                await human_type(await page.wait_for_selector('input[placeholder*="Email"]'), email)
+                await page.click('button:has-text("Reset / Generate Password")')
+
+                code = None
+                for _ in range(15):
+                    await asyncio.sleep(6)
+                    code = fetch_guerrilla_code(sid)
+                    if code: break
+
+                if not code:
+                    ws.update_cell(row_num, 2, f"{timestamp} - No Email")
+                    continue
+
+                await (await page.wait_for_selector('input[placeholder*="1"]')).fill(code)
+                pws = await page.query_selector_all('input[type="password"]')
+                for p_in in pws: await p_in.fill(FIXED_PASSWORD)
+                await page.click('button:has-text("Reset / Generate Password")')
+                await asyncio.sleep(5)
+
+                await page.goto("https://youdiepie.com/free-youtube-views", timeout=60000)
+                await (await page.wait_for_selector('input[type="checkbox"]')).check()
+                yt_in = await page.wait_for_selector('input[placeholder*="youtube.com/watch"]')
+                await yt_in.click(click_count=3)
+                await page.keyboard.press("Backspace")
+                await human_type(yt_in, yt_link)
+                await page.keyboard.press("Tab")
+                await page.mouse.click(0, 0)
+                await asyncio.sleep(12)
+
+                submit_btn = await page.wait_for_selector('button:not(.nav-link):has-text("Checkout"), button:not(.nav-link):has-text("Order")', timeout=15000)
+                await submit_btn.click(force=True)
+
+                try:
+                    await page.wait_for_selector('.order-list, text=My Orders', timeout=20000)
+                    ws.update_cell(row_num, 2, f"{timestamp} - Success ({email})")
+                except:
+                    ws.update_cell(row_num, 2, f"{timestamp} - Verify Error")
+
+            except Exception as e:
+                print(f"Error: {e}")
+                try: ws.update_cell(row_num, 2, f"{timestamp} - Error")
+                except: pass
+
+            await context.clear_cookies()
+            await asyncio.sleep(5)
+
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
