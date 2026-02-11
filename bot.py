@@ -12,47 +12,39 @@ from playwright.async_api import async_playwright
 # --- CONFIGURATION ---
 FIXED_PASSWORD = os.getenv("FIXED_PASSWORD", "APNK@2901")
 SHEET_NAME = os.getenv("SHEET_NAME", "YoutubeBotLinks")
-
-# FIX: Explicitly define scopes to allow EDITING (fixes 403 error)
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
 def setup_sheets(name):
-    # It is recommended to put your service account JSON into a secret named GOOGLE_CREDENTIALS
     creds_json = os.getenv("GOOGLE_TOKEN")
     if not creds_json:
         raise ValueError("GOOGLE_TOKEN secret is missing!")
-    
     creds_data = json.loads(creds_json)
-    # FIX: Use Service Account Credentials with explicit scopes
     creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
     gc = gspread.authorize(creds)
-    
     try:
-        sh = gc.open(name)
-        return sh.get_worksheet(0)
+        return gc.open(name).get_worksheet(0)
     except Exception as e:
-        available = [s.title for s in gc.openall()]
-        print(f"❌ Error: Could not find sheet '{name}'. Available: {available}")
+        print(f"❌ Sheet Error: {e}")
         raise e
 
-def get_guerrilla_mail():
-    try:
-        res = requests.get("https://www.guerrillamail.com/ajax.php?f=get_email_address").json()
-        return res['email_addr'], res['sid_token']
-    except: return None, None
+def get_guerrilla_mail(retries=3):
+    """Aggressive retry logic for getting the burner email"""
+    for attempt in range(retries):
+        try:
+            res = requests.get("https://www.guerrillamail.com/ajax.php?f=get_email_address", timeout=10).json()
+            return res['email_addr'], res['sid_token']
+        except Exception as e:
+            print(f"⚠️ Guerrilla Mail attempt {attempt+1} failed... retrying")
+            time.sleep(2)
+    return None, None
 
 def fetch_guerrilla_code(sid):
     try:
-        res = requests.get(f"https://www.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token={sid}").json()
-        if res['list']:
+        res = requests.get(f"https://www.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token={sid}", timeout=10).json()
+        if res.get('list'):
             for msg in res['list']:
-                m_id = msg['mail_id']
-                full_res = requests.get(f"https://www.guerrillamail.com/ajax.php?f=fetch_email&email_id={m_id}&sid_token={sid}").json()
-                body = full_res['mail_body']
-                match = re.search(r'\b\d{6}\b', body)
+                full_res = requests.get(f"https://www.guerrillamail.com/ajax.php?f=fetch_email&email_id={msg['mail_id']}&sid_token={sid}").json()
+                match = re.search(r'\b\d{6}\b', full_res.get('mail_body', ''))
                 if match and match.group(0) not in ["333333", "123456"]:
                     return match.group(0)
     except: pass
@@ -60,87 +52,87 @@ def fetch_guerrilla_code(sid):
 
 async def human_type(element, text):
     for char in text:
-        await element.type(char, delay=random.randint(40, 90))
+        await element.type(char, delay=random.randint(30, 70))
 
 async def main():
     ws = setup_sheets(SHEET_NAME)
-    # Get all rows to avoid NoneType errors during iteration
-    all_data = ws.get_all_records()
-    print(f"✅ Loaded {len(all_data)} links. Starting...")
+    # Using col_values for column 1 to get all targets
+    links = ws.col_values(1)[1:] 
+    print(f"🚀 Processing {len(links)} targets with burner accounts...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
 
-        for i, row in enumerate(all_data):
-            row_num = i + 2  # Offset for header and 0-indexing
-            yt_link = row.get('Target')
+        for i, yt_link in enumerate(links):
+            row_num = i + 2
+            timestamp = datetime.now().strftime("%H:%M:%S")
             
-            # FIX: Syntax Error in timestamp string literal 
-            timestamp = datetime.now().strftime("%H:%M:%S") 
-            
-            # Generate new burner account email
+            # Step 1: Create the Burner
             email, sid = get_guerrilla_mail()
-
-            # FIX: Skip if email generation failed (prevents NoneType errors)
             if not email:
-                print(f"[{i+1}] Skipping: Could not generate burner email.")
+                print(f"[{i+1}] ❌ Failed to get email after retries. Skipping.")
                 continue
 
             try:
-                print(f"[{i+1}] Target: {yt_link} | Email: {email}")
+                print(f"[{i+1}] Using: {email} for {yt_link}")
                 
-                # --- PASSWORD RESET / ACCOUNT CREATION ---
+                # Register/Reset Account
                 await page.goto("https://youdiepie.com/password/reset", timeout=60000)
                 await human_type(await page.wait_for_selector('input[placeholder*="Email"]'), email)
                 await page.click('button:has-text("Reset / Generate Password")')
 
+                # Wait for OTP
                 code = None
-                for _ in range(15):
+                for _ in range(12): # 72 seconds max wait
                     await asyncio.sleep(6)
                     code = fetch_guerrilla_code(sid)
                     if code: break
 
                 if not code:
-                    ws.update_cell(row_num, 2, f"{timestamp} - No OTP")
+                    ws.update_cell(row_num, 2, f"{timestamp} - Timeout (No OTP)")
                     continue
 
+                # Set Password
                 await (await page.wait_for_selector('input[placeholder*="1"]')).fill(code)
-                pws = await page.query_selector_all('input[type="password"]')
-                for p_in in pws: await p_in.fill(FIXED_PASSWORD)
+                for p_in in await page.query_selector_all('input[type="password"]'):
+                    await p_in.fill(FIXED_PASSWORD)
                 await page.click('button:has-text("Reset / Generate Password")')
-                await asyncio.sleep(5)
+                await asyncio.sleep(4)
 
-                # --- PROCESS YOUTUBE LINK ---
+                # Claim Views
                 await page.goto("https://youdiepie.com/free-youtube-views", timeout=60000)
                 await (await page.wait_for_selector('input[type="checkbox"]')).check()
+                
                 yt_in = await page.wait_for_selector('input[placeholder*="youtube.com/watch"]')
                 await yt_in.click(click_count=3)
                 await page.keyboard.press("Backspace")
                 await human_type(yt_in, yt_link)
                 await page.keyboard.press("Tab")
-                await page.mouse.click(0, 0)
-                await asyncio.sleep(12)
+                
+                # Lowered internal site timer to 6 seconds
+                await asyncio.sleep(6) 
 
-                submit_btn = await page.wait_for_selector('button:not(.nav-link):has-text("Checkout"), button:not(.nav-link):has-text("Order")', timeout=15000)
+                submit_btn = await page.wait_for_selector('button:not(.nav-link):has-text("Checkout"), button:not(.nav-link):has-text("Order")', timeout=10000)
                 await submit_btn.click(force=True)
 
-                # --- VERIFY SUCCESS ---
+                # Finalize
                 try:
-                    await page.wait_for_selector('.order-list, text=My Orders', timeout=20000)
+                    await page.wait_for_selector('.order-list, text=My Orders', timeout=15000)
                     ws.update_cell(row_num, 2, f"{timestamp} - Success ({email})")
+                    print(f"    ✅ Success")
                 except:
-                    ws.update_cell(row_num, 2, f"{timestamp} - Verify Error")
+                    ws.update_cell(row_num, 2, f"{timestamp} - Status Unknown")
 
             except Exception as e:
-                print(f"Error on row {row_num}: {e}")
-                try: ws.update_cell(row_num, 2, f"{timestamp} - Error")
+                print(f"    ❌ Error: {e}")
+                try: ws.update_cell(row_num, 2, f"{timestamp} - Execution Error")
                 except: pass
 
-            # Cleanup for next burner account
+            # Clear session for next burner
             await context.clear_cookies()
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
         await browser.close()
 
