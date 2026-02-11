@@ -6,30 +6,36 @@ import json
 import requests
 from datetime import datetime
 import gspread
-from google.oauth2.credentials import Credentials
+from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
 FIXED_PASSWORD = os.getenv("FIXED_PASSWORD", "APNK@2901")
 SHEET_NAME = os.getenv("SHEET_NAME", "YoutubeBotLinks")
 
+# FIX: Explicitly define scopes to allow EDITING (fixes 403 error)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
 def setup_sheets(name):
-    token_json = os.getenv("GOOGLE_TOKEN")
-    if not token_json:
+    # It is recommended to put your service account JSON into a secret named GOOGLE_CREDENTIALS
+    creds_json = os.getenv("GOOGLE_TOKEN")
+    if not creds_json:
         raise ValueError("GOOGLE_TOKEN secret is missing!")
     
-    token_data = json.loads(token_json)
-    creds = Credentials.from_authorized_user_info(token_data)
+    creds_data = json.loads(creds_json)
+    # FIX: Use Service Account Credentials with explicit scopes
+    creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
     gc = gspread.authorize(creds)
     
     try:
         sh = gc.open(name)
         return sh.get_worksheet(0)
     except Exception as e:
-        print(f"❌ Error: Could not find sheet '{name}'. Check your Secrets.")
-        # List sheets to help debug
         available = [s.title for s in gc.openall()]
-        print(f"Available sheets: {available}")
+        print(f"❌ Error: Could not find sheet '{name}'. Available: {available}")
         raise e
 
 def get_guerrilla_mail():
@@ -58,21 +64,34 @@ async def human_type(element, text):
 
 async def main():
     ws = setup_sheets(SHEET_NAME)
-    links = ws.col_values(1)[1:]
-    print(f"✅ Loaded {len(links)} links. Starting...")
+    # Get all rows to avoid NoneType errors during iteration
+    all_data = ws.get_all_records()
+    print(f"✅ Loaded {len(all_data)} links. Starting...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
 
-        for i, yt_link in enumerate(links):
-            row_num = i + 2
-            timestamp = datetime.now().strftime("%H:%M:%S") # FIXED TYPO HERE
+        for i, row in enumerate(all_data):
+            row_num = i + 2  # Offset for header and 0-indexing
+            yt_link = row.get('Target')
+            
+            # FIX: Syntax Error in timestamp string literal 
+            timestamp = datetime.now().strftime("%H:%M:%S") 
+            
+            # Generate new burner account email
             email, sid = get_guerrilla_mail()
+
+            # FIX: Skip if email generation failed (prevents NoneType errors)
+            if not email:
+                print(f"[{i+1}] Skipping: Could not generate burner email.")
+                continue
 
             try:
                 print(f"[{i+1}] Target: {yt_link} | Email: {email}")
+                
+                # --- PASSWORD RESET / ACCOUNT CREATION ---
                 await page.goto("https://youdiepie.com/password/reset", timeout=60000)
                 await human_type(await page.wait_for_selector('input[placeholder*="Email"]'), email)
                 await page.click('button:has-text("Reset / Generate Password")')
@@ -84,7 +103,7 @@ async def main():
                     if code: break
 
                 if not code:
-                    ws.update_cell(row_num, 2, f"{timestamp} - No Email")
+                    ws.update_cell(row_num, 2, f"{timestamp} - No OTP")
                     continue
 
                 await (await page.wait_for_selector('input[placeholder*="1"]')).fill(code)
@@ -93,6 +112,7 @@ async def main():
                 await page.click('button:has-text("Reset / Generate Password")')
                 await asyncio.sleep(5)
 
+                # --- PROCESS YOUTUBE LINK ---
                 await page.goto("https://youdiepie.com/free-youtube-views", timeout=60000)
                 await (await page.wait_for_selector('input[type="checkbox"]')).check()
                 yt_in = await page.wait_for_selector('input[placeholder*="youtube.com/watch"]')
@@ -106,6 +126,7 @@ async def main():
                 submit_btn = await page.wait_for_selector('button:not(.nav-link):has-text("Checkout"), button:not(.nav-link):has-text("Order")', timeout=15000)
                 await submit_btn.click(force=True)
 
+                # --- VERIFY SUCCESS ---
                 try:
                     await page.wait_for_selector('.order-list, text=My Orders', timeout=20000)
                     ws.update_cell(row_num, 2, f"{timestamp} - Success ({email})")
@@ -113,10 +134,11 @@ async def main():
                     ws.update_cell(row_num, 2, f"{timestamp} - Verify Error")
 
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error on row {row_num}: {e}")
                 try: ws.update_cell(row_num, 2, f"{timestamp} - Error")
                 except: pass
 
+            # Cleanup for next burner account
             await context.clear_cookies()
             await asyncio.sleep(5)
 
