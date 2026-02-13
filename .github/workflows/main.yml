@@ -9,17 +9,30 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
+      
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+          
       - name: Install Tools
         run: |
           pip install playwright gspread google-auth requests
           playwright install chromium
+          
       - name: Execute Bot
         env:
           GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           FIXED_PASSWORD: ${{ secrets.FIXED_PASSWORD }}
         run: python bot.py
+
+      # 🎥 NEW: SAVE VIDEO & SCREENSHOTS
+      - name: Upload Bot Proof (Video & Screenshots)
+        if: always() # Runs even if the bot script fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-debug-files
+          path: |
+            recordings/
+            *.png
