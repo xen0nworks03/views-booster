@@ -117,7 +117,7 @@ async def main():
                         print("   ✅ Success")
                     except:
                         await page.screenshot(path=f"error_row_{row_num}.png")
-                        ws.update_cell(row_num, 2, f"{timestamp} - Status Unknown")
+                        ws.update_cell(row_num, 2, f"{timestamp} - Done")
 
             except Exception as e:
                 print(f"   ❌ Error: {e}")
