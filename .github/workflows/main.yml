@@ -2,7 +2,7 @@ name: Youtube Bot Runner
 on:
   workflow_dispatch: # Allows you to start it with a button
   schedule:
-    - cron: '0 */6 * * *' # Automatically runs every 6 hours
+    - cron: '0 */24 * * *' # Automatically runs every 6 hours
 
 jobs:
   run-bot:
