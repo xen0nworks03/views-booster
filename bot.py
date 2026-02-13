@@ -4,6 +4,7 @@ import re
 import os
 import json
 import requests
+import time
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
@@ -28,7 +29,6 @@ def setup_sheets(name):
         raise e
 
 def get_guerrilla_mail(retries=3):
-    """Aggressive retry logic for getting the burner email"""
     for attempt in range(retries):
         try:
             res = requests.get("https://www.guerrillamail.com/ajax.php?f=get_email_address", timeout=10).json()
@@ -56,50 +56,52 @@ async def human_type(element, text):
 
 async def main():
     ws = setup_sheets(SHEET_NAME)
-    # Using col_values for column 1 to get all targets
     links = ws.col_values(1)[1:] 
-    print(f"🚀 Processing {len(links)} targets with burner accounts...")
+    print(f"🚀 Processing {len(links)} targets. Recording video enabled.")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        # 🎥 VIDEO RECORDING SETTINGS
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            record_video_dir="recordings/",
+            record_video_size={"width": 1280, "height": 720}
+        )
         page = await context.new_page()
 
         for i, yt_link in enumerate(links):
             row_num = i + 2
             timestamp = datetime.now().strftime("%H:%M:%S")
             
-            # Step 1: Create the Burner
             email, sid = get_guerrilla_mail()
             if not email:
-                print(f"[{i+1}] ❌ Failed to get email after retries. Skipping.")
+                print(f"[{i+1}] ❌ Email fail. Skipping.")
                 continue
 
             try:
-                print(f"[{i+1}] Using: {email} for {yt_link}")
+                print(f"[{i+1}] {email} -> {yt_link}")
                 
-                # Register/Reset Account
                 await page.goto("https://youdiepie.com/password/reset", timeout=60000)
                 await human_type(await page.wait_for_selector('input[placeholder*="Email"]'), email)
                 await page.click('button:has-text("Reset / Generate Password")')
 
-                # Wait for OTP
+                # ⏱️ STEP 1 FIX: INCREASED OTP WAIT (20 loops = 120 seconds)
                 code = None
-                for _ in range(12): # 72 seconds max wait
+                for _ in range(20): 
                     await asyncio.sleep(6)
                     code = fetch_guerrilla_code(sid)
                     if code: break
 
                 if not code:
+                    print(f"   ⚠️ OTP Timeout")
                     ws.update_cell(row_num, 2, f"{timestamp} - Timeout (No OTP)")
                     continue
 
-                # Set Password
                 await (await page.wait_for_selector('input[placeholder*="1"]')).fill(code)
                 for p_in in await page.query_selector_all('input[type="password"]'):
                     await p_in.fill(FIXED_PASSWORD)
                 await page.click('button:has-text("Reset / Generate Password")')
-                await asyncio.sleep(4)
+                await asyncio.sleep(5)
 
                 # Claim Views
                 await page.goto("https://youdiepie.com/free-youtube-views", timeout=60000)
@@ -111,29 +113,31 @@ async def main():
                 await human_type(yt_in, yt_link)
                 await page.keyboard.press("Tab")
                 
-                # Lowered internal site timer to 6 seconds
-                await asyncio.sleep(6) 
+                # ⏱️ STEP 2 FIX: Increased verification wait to 10s
+                await asyncio.sleep(10) 
 
                 submit_btn = await page.wait_for_selector('button:not(.nav-link):has-text("Checkout"), button:not(.nav-link):has-text("Order")', timeout=10000)
                 await submit_btn.click(force=True)
 
                 # Finalize
                 try:
-                    await page.wait_for_selector('.order-list, text=My Orders', timeout=15000)
+                    # Look for success indicators or the "Order History" page
+                    await page.wait_for_selector('.order-list, text=Success, text=My Orders', timeout=15000)
                     ws.update_cell(row_num, 2, f"{timestamp} - Success ({email})")
-                    print(f"    ✅ Success")
+                    print(f"   ✅ Success")
                 except:
+                    print(f"   ⚠️ Status Unknown - Taking Screenshot")
+                    await page.screenshot(path=f"error_row_{row_num}.png")
                     ws.update_cell(row_num, 2, f"{timestamp} - Status Unknown")
 
             except Exception as e:
-                print(f"    ❌ Error: {e}")
-                try: ws.update_cell(row_num, 2, f"{timestamp} - Execution Error")
-                except: pass
+                print(f"   ❌ Error: {e}")
+                ws.update_cell(row_num, 2, f"{timestamp} - Execution Error")
 
-            # Clear session for next burner
             await context.clear_cookies()
             await asyncio.sleep(2)
 
+        await context.close()
         await browser.close()
 
 if __name__ == "__main__":
